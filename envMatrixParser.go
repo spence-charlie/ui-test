@@ -1,0 +1,1391 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/net/html"
+)
+
+// Data structures
+type InfrastructureData struct {
+	AimID        string                        `json:"aimId"`
+	SectionName  string                        `json:"sectionName"`
+	SectionType  string                        `json:"sectionType"`
+	LastUpdated  time.Time                     `json:"lastUpdated"`
+	Applications map[string]map[string]interface{} `json:"applications"`
+	Data         map[string]map[string][]RowEntry  `json:"data"`
+}
+
+type RowEntry struct {
+	RowKey         string                 `json:"rowKey"`
+	IsGeneratedKey bool                   `json:"isGeneratedKey"`
+	Data           []map[string]interface{} `json:"data"`
+}
+
+type TableMetadata struct {
+	EnvironmentHeaders    []string `json:"environmentHeaders"`
+	ColumnCount          int      `json:"columnCount"`
+	HasEnvironmentHeaders bool     `json:"hasEnvironmentHeaders"`
+}
+
+type Parser struct {
+	results        []InfrastructureData
+	currentSection *InfrastructureData
+	doc            *html.Node
+}
+
+// HTML parsing utilities
+func NewParser() *Parser {
+	return &Parser{
+		results: make([]InfrastructureData, 0),
+	}
+}
+
+func (p *Parser) ParseHTMLFile(filename string) ([]InfrastructureData, error) {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %v", err)
+	}
+
+	doc, err := html.Parse(strings.NewReader(string(content)))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %v", err)
+	}
+
+	p.doc = doc
+	
+	// Find AIM sections
+	sections := p.findAimSections(doc)
+	
+	// Process each section
+	for _, section := range sections {
+		sectionData := p.processSectionContent(section)
+		if sectionData != nil && len(sectionData.Data) > 0 {
+			p.results = append(p.results, *sectionData)
+		}
+	}
+
+	return p.results, nil
+}
+
+type AimSection struct {
+	AimID   string
+	Title   string
+	Element *html.Node
+}
+
+func (p *Parser) findAimSections(node *html.Node) []AimSection {
+	var sections []AimSection
+	
+	// Look for AIM ID references
+	p.walkHTML(node, func(n *html.Node) {
+		if n.Type == html.TextNode {
+			text := strings.TrimSpace(n.Data)
+			aimRegex := regexp.MustCompile(`AIM\s*ID\s*[-:]\s*(\d+)`)
+			matches := aimRegex.FindStringSubmatch(text)
+			
+			if len(matches) > 1 {
+				aimID := matches[1]
+				title := p.extractSectionTitle(n)
+				
+				sections = append(sections, AimSection{
+					AimID:   aimID,
+					Title:   title,
+					Element: n.Parent,
+				})
+			}
+		}
+	})
+
+	// If no AIM IDs found, look for major section headers
+	if len(sections) == 0 {
+		sections = p.findMajorSections(node)
+	}
+
+	// If still no sections, treat entire document as one section
+	if len(sections) == 0 {
+		title := p.getDocumentTitle(node)
+		sections = append(sections, AimSection{
+			AimID:   "UNKNOWN",
+			Title:   title,
+			Element: node,
+		})
+	}
+
+	return sections
+}
+
+func (p *Parser) findMajorSections(node *html.Node) []AimSection {
+	var sections []AimSection
+	
+	p.walkHTML(node, func(n *html.Node) {
+		if n.Type == html.ElementNode && (n.Data == "h1" || n.Data == "h2" || n.Data == "caption") {
+			text := strings.ToLower(p.getTextContent(n))
+			if strings.Contains(text, "sso") || strings.Contains(text, "environment") ||
+			   strings.Contains(text, "matrix") || strings.Contains(text, "infrastructure") {
+				
+				aimID := p.generateAimID(text)
+				title := p.getTextContent(n)
+				
+				sections = append(sections, AimSection{
+					AimID:   aimID,
+					Title:   strings.TrimSpace(title),
+					Element: n,
+				})
+			}
+		}
+	})
+	
+	return sections
+}
+
+func (p *Parser) generateAimID(text string) string {
+	// Generate AIM ID from section title
+	words := strings.Fields(regexp.MustCompile(`[^a-zA-Z0-9\s]`).ReplaceAllString(text, " "))
+	var acronym strings.Builder
+	
+	for _, word := range words {
+		if len(word) > 0 {
+			acronym.WriteByte(strings.ToUpper(word)[0])
+		}
+	}
+	
+	timestamp := strconv.FormatInt(time.Now().Unix()%1000000, 10)
+	return acronym.String() + "_" + timestamp
+}
+
+func (p *Parser) extractSectionTitle(node *html.Node) string {
+	// Try to find meaningful title from nearby elements
+	current := node.Parent
+	for current != nil && current.Data != "body" {
+		if current.Type == html.ElementNode {
+			text := strings.TrimSpace(p.getTextContent(current))
+			if len(text) > 0 && len(text) < 200 {
+				return text
+			}
+		}
+		current = current.Parent
+	}
+	return "Infrastructure Section"
+}
+
+func (p *Parser) getDocumentTitle(node *html.Node) string {
+	var title string
+	p.walkHTML(node, func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "title" {
+			title = p.getTextContent(n)
+		}
+	})
+	
+	if title == "" {
+		title = "Infrastructure Matrix"
+	}
+	return title
+}
+
+func (p *Parser) processSectionContent(section AimSection) *InfrastructureData {
+	sectionData := &InfrastructureData{
+		AimID:        section.AimID,
+		SectionName:  section.Title,
+		SectionType:  "infrastructure_matrix",
+		LastUpdated:  time.Now(),
+		Applications: make(map[string]map[string]interface{}),
+		Data:         make(map[string]map[string][]RowEntry),
+	}
+
+	// Find tables in this section
+	tables := p.findTables(section.Element)
+	
+	currentApplication := "default"
+	
+	for _, table := range tables {
+		if !p.isInfrastructureTable(table) {
+			continue
+		}
+		
+		tableData := p.parseTable(table)
+		if len(tableData) > 0 {
+			// Detect application name
+			appName := p.detectApplicationName(table)
+			if appName != "" {
+				currentApplication = appName
+			}
+			
+			// Initialize application data if needed
+			if sectionData.Applications[currentApplication] == nil {
+				sectionData.Applications[currentApplication] = make(map[string]interface{})
+			}
+			
+			// Merge table data
+			p.mergeTableData(sectionData.Data, tableData)
+		}
+	}
+
+	return sectionData
+}
+
+func (p *Parser) findTables(node *html.Node) []*html.Node {
+	var tables []*html.Node
+	
+	p.walkHTML(node, func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "table" {
+			tables = append(tables, n)
+		}
+	})
+	
+	return tables
+}
+
+func (p *Parser) isInfrastructureTable(table *html.Node) bool {
+	text := strings.ToLower(p.getTextContent(table))
+	
+	hasInfraKeywords := strings.Contains(text, "server") || 
+					   strings.Contains(text, "vip") ||
+					   strings.Contains(text, "ip") || 
+					   strings.Contains(text, "environment") ||
+					   strings.Contains(text, "dns") || 
+					   strings.Contains(text, "database")
+
+	// Check for background colors (infrastructure tables typically have styling)
+	hasBgColors := p.hasBackgroundColors(table)
+	
+	// Check column count
+	rows := p.findTableRows(table)
+	hasMultipleCols := false
+	if len(rows) > 0 {
+		cells := p.findTableCells(rows[0])
+		hasMultipleCols = len(cells) > 2
+	}
+
+	return hasInfraKeywords && (hasBgColors || hasMultipleCols)
+}
+
+func (p *Parser) hasBackgroundColors(table *html.Node) bool {
+	found := false
+	p.walkHTML(table, func(n *html.Node) {
+		if n.Type == html.ElementNode && (n.Data == "td" || n.Data == "th") {
+			for _, attr := range n.Attr {
+				if attr.Key == "bgcolor" {
+					found = true
+					return
+				}
+			}
+		}
+	})
+	return found
+}
+
+func (p *Parser) parseTable(table *html.Node) map[string]map[string][]RowEntry {
+	tableData := make(map[string]map[string][]RowEntry)
+	rows := p.findTableRows(table)
+	
+	var environmentHeaders []string
+	currentSection := "general"
+	environmentHeadersFound := false
+	generatedKeyCounters := make(map[string]int)
+
+	// First pass: detect table structure
+	for _, row := range rows {
+		rowInfo := p.analyzeTableRow(row)
+		
+		if rowInfo["type"] == "environment_header" && !environmentHeadersFound {
+			environmentHeaders = rowInfo["environments"].([]string)
+			environmentHeadersFound = true
+			continue
+		}
+	}
+
+	// If no explicit headers found, infer from first data row
+	if !environmentHeadersFound {
+		firstDataRow := p.findFirstDataRow(rows)
+		if firstDataRow != nil {
+			environmentHeaders = p.inferEnvironmentHeaders(firstDataRow)
+		}
+	}
+
+	// Second pass: parse data
+	for _, row := range rows {
+		rowInfo := p.analyzeTableRow(row)
+		
+		if rowInfo["type"] == "environment_header" {
+			continue
+		}
+		
+		if rowInfo["type"] == "section_header" {
+			currentSection = rowInfo["section"].(string)
+			if tableData[currentSection] == nil {
+				tableData[currentSection] = make(map[string][]RowEntry)
+			}
+			continue
+		}
+		
+		if rowInfo["type"] == "data_row" && len(environmentHeaders) > 0 {
+			p.parseTableDataRow(row, currentSection, environmentHeaders, tableData, generatedKeyCounters)
+		}
+	}
+
+	return tableData
+}
+
+func (p *Parser) findTableRows(table *html.Node) []*html.Node {
+	var rows []*html.Node
+	
+	p.walkHTML(table, func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "tr" {
+			rows = append(rows, n)
+		}
+	})
+	
+	return rows
+}
+
+func (p *Parser) findTableCells(row *html.Node) []*html.Node {
+	var cells []*html.Node
+	
+	for child := row.FirstChild; child != nil; child = child.NextSibling {
+		if child.Type == html.ElementNode && (child.Data == "td" || child.Data == "th") {
+			cells = append(cells, child)
+		}
+	}
+	
+	return cells
+}
+
+func (p *Parser) analyzeTableRow(row *html.Node) map[string]interface{} {
+	cells := p.findTableCells(row)
+	rowText := strings.ToLower(p.getTextContent(row))
+	
+	result := make(map[string]interface{})
+	
+	// Environment header detection
+	if p.hasEnvironmentIndicators(rowText) || p.hasEnvironmentHeaderStyle(row) {
+		result["type"] = "environment_header"
+		result["environments"] = p.extractEnvironmentHeaders(row)
+		return result
+	}
+	
+	// Section header detection
+	if p.isSectionHeaderRow(row) {
+		result["type"] = "section_header"
+		if len(cells) > 0 {
+			result["section"] = p.standardizeSectionName(p.getTextContent(cells[0]))
+		}
+		return result
+	}
+	
+	// Data row detection
+	if len(cells) > 0 && !p.isEmptyRow(row) {
+		result["type"] = "data_row"
+		return result
+	}
+	
+	result["type"] = "unknown"
+	return result
+}
+
+func (p *Parser) hasEnvironmentIndicators(text string) bool {
+	indicators := []string{
+		"test", "live", "prod", "qa", "dev", "stage", "staging",
+		"e1", "e2", "e3", "e4", "e5",
+		"environment", "env",
+		"alpha", "beta", "gamma", "delta",
+		"stack1", "stack2", "stack3",
+		"ipc1", "ipc2", "ipc3",
+		"dc1", "dc2", "datacenter",
+	}
+	
+	for _, indicator := range indicators {
+		if strings.Contains(text, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Parser) hasEnvironmentHeaderStyle(row *html.Node) bool {
+	// Check for header styling patterns
+	hasHeaderBgColor := false
+	hasHeaderTags := false
+	
+	p.walkHTML(row, func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			if n.Data == "th" {
+				hasHeaderTags = true
+			}
+			
+			for _, attr := range n.Attr {
+				if attr.Key == "bgcolor" && 
+				   (attr.Val == "lightgreen" || attr.Val == "lightblue" || attr.Val == "#BCA9F5") {
+					hasHeaderBgColor = true
+				}
+			}
+		}
+	})
+	
+	return hasHeaderBgColor || hasHeaderTags
+}
+
+func (p *Parser) extractEnvironmentHeaders(row *html.Node) []string {
+	var environments []string
+	cells := p.findTableCells(row)
+	
+	for _, cell := range cells {
+		text := strings.TrimSpace(p.getTextContent(cell))
+		colspan := p.getColspan(cell)
+		
+		if text == "" || text == "\u00a0" {
+			// Generate placeholder names for empty cells
+			for i := 0; i < colspan; i++ {
+				environments = append(environments, fmt.Sprintf("Column_%d", len(environments)+1))
+			}
+			continue
+		}
+		
+		envName := p.standardizeEnvironmentName(text)
+		
+		// Handle colspan
+		if colspan > 1 {
+			if p.isSingleEnvironmentSpanningColumns(text) {
+				for i := 0; i < colspan; i++ {
+					if i == 0 {
+						environments = append(environments, envName)
+					} else {
+						environments = append(environments, fmt.Sprintf("%s_Part%d", envName, i+1))
+					}
+				}
+			} else {
+				subEnvs := p.splitSpannedEnvironment(text, colspan)
+				environments = append(environments, subEnvs...)
+			}
+		} else {
+			environments = append(environments, envName)
+		}
+	}
+	
+	return environments
+}
+
+func (p *Parser) getColspan(cell *html.Node) int {
+	for _, attr := range cell.Attr {
+		if attr.Key == "colspan" {
+			if val, err := strconv.Atoi(attr.Val); err == nil {
+				return val
+			}
+		}
+	}
+	return 1
+}
+
+func (p *Parser) isSingleEnvironmentSpanningColumns(text string) bool {
+	lowerText := strings.ToLower(text)
+	
+	patterns := []string{
+		`^e\d+$`,
+		`^(test|prod|qa|dev|staging)$`,
+		"single.*environment",
+		"combined",
+		"shared",
+	}
+	
+	for _, pattern := range patterns {
+		if matched, _ := regexp.MatchString(pattern, lowerText); matched {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Parser) splitSpannedEnvironment(text string, colspan int) []string {
+	var envs []string
+	
+	// Try to identify sub-environments
+	subEnvRegex := regexp.MustCompile(`([A-Z]\d+(?:\s*[-/]\s*[A-Z]\d+)*)`)
+	matches := subEnvRegex.FindAllString(text, -1)
+	
+	if len(matches) >= colspan {
+		for i := 0; i < colspan; i++ {
+			if i < len(matches) {
+				envs = append(envs, p.standardizeEnvironmentName(matches[i]))
+			} else {
+				envs = append(envs, fmt.Sprintf("%s_%d", p.standardizeEnvironmentName(text), i+1))
+			}
+		}
+	} else {
+		// Default: create numbered variations
+		baseName := p.standardizeEnvironmentName(text)
+		for i := 0; i < colspan; i++ {
+			if i == 0 {
+				envs = append(envs, baseName)
+			} else {
+				envs = append(envs, fmt.Sprintf("%s_%d", baseName, i+1))
+			}
+		}
+	}
+	
+	return envs
+}
+
+func (p *Parser) standardizeEnvironmentName(text string) string {
+	cleaned := strings.ToLower(strings.TrimSpace(text))
+	
+	// Common environment mappings
+	mappings := map[string]string{
+		"e1.*test":        "E1_Test",
+		"e1.*live":        "E1_Live", 
+		"e1.*prod":        "E1_Prod",
+		"e2.*qa":          "E2_QA",
+		"e2.*test":        "E2_Test",
+		"e3.*stack1":      "E3_Stack1",
+		"e3.*stack2":      "E3_Stack2",
+		"e3.*ipc1":        "E3_IPC1",
+		"e3.*ipc2":        "E3_IPC2",
+	}
+	
+	for pattern, result := range mappings {
+		if matched, _ := regexp.MatchString(pattern, cleaned); matched {
+			return result
+		}
+	}
+	
+	// Generic patterns
+	if strings.Contains(cleaned, "test") {
+		return "Test"
+	}
+	if strings.Contains(cleaned, "live") || strings.Contains(cleaned, "prod") {
+		return "Production"
+	}
+	if strings.Contains(cleaned, "qa") {
+		return "QA"
+	}
+	if strings.Contains(cleaned, "dev") {
+		return "Development"
+	}
+	if strings.Contains(cleaned, "stage") {
+		return "Staging"
+	}
+	
+	// Environment codes
+	envRegex := regexp.MustCompile(`e(\d+)`)
+	if matches := envRegex.FindStringSubmatch(cleaned); len(matches) > 1 {
+		return fmt.Sprintf("E%s", matches[1])
+	}
+	
+	// Default: clean up and return
+	result := regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(text, "_")
+	result = regexp.MustCompile(`_+`).ReplaceAllString(result, "_")
+	result = strings.Trim(result, "_")
+	
+	if result == "" {
+		return "Unknown"
+	}
+	return result
+}
+
+func (p *Parser) findFirstDataRow(rows []*html.Node) *html.Node {
+	for _, row := range rows {
+		rowInfo := p.analyzeTableRow(row)
+		if rowInfo["type"] == "data_row" {
+			return row
+		}
+	}
+	return nil
+}
+
+func (p *Parser) inferEnvironmentHeaders(row *html.Node) []string {
+	var headers []string
+	cells := p.findTableCells(row)
+	
+	startIndex := 0
+	if len(cells) > 0 {
+		firstCellText := strings.TrimSpace(p.getTextContent(cells[0]))
+		if p.hasRowKey(firstCellText) {
+			startIndex = 1
+		}
+	}
+	
+	for i := startIndex; i < len(cells); i++ {
+		cell := cells[i]
+		cellText := p.getTextContent(cell)
+		colspan := p.getColspan(cell)
+		
+		envName := p.guessEnvironmentName(cellText, len(headers))
+		
+		for j := 0; j < colspan; j++ {
+			if j == 0 {
+				headers = append(headers, envName)
+			} else {
+				headers = append(headers, fmt.Sprintf("%s_%d", envName, j))
+			}
+		}
+	}
+	
+	return headers
+}
+
+func (p *Parser) guessEnvironmentName(cellText string, columnIndex int) string {
+	if cellText != "" {
+		lowerText := strings.ToLower(cellText)
+		
+		if strings.Contains(lowerText, "test") {
+			return "Test_Env"
+		}
+		if strings.Contains(lowerText, "prod") || strings.Contains(lowerText, "live") {
+			return "Prod_Env"
+		}
+		if strings.Contains(lowerText, "qa") {
+			return "QA_Env"
+		}
+		if strings.Contains(lowerText, "dev") {
+			return "Dev_Env"
+		}
+		if strings.Contains(lowerText, "stage") {
+			return "Stage_Env"
+		}
+		
+		envRegex := regexp.MustCompile(`e(\d+)`)
+		if matches := envRegex.FindStringSubmatch(lowerText); len(matches) > 1 {
+			return fmt.Sprintf("E%s", matches[1])
+		}
+		
+		if len(cellText) < 20 && regexp.MustCompile(`^[A-Za-z0-9_\-\s]+$`).MatchString(cellText) {
+			return p.standardizeEnvironmentName(cellText)
+		}
+	}
+	
+	return fmt.Sprintf("Environment_%d", columnIndex+1)
+}
+
+func (p *Parser) isSectionHeaderRow(row *html.Node) bool {
+	cells := p.findTableCells(row)
+	if len(cells) == 0 {
+		return false
+	}
+	
+	firstCell := cells[0]
+	text := strings.ToLower(p.getTextContent(firstCell))
+	
+	// Check for common section indicators
+	keywords := []string{
+		"dns", "server", "vip", "database", "oracle", "application",
+		"web tier", "app tier", "network", "router", "switch",
+		"load balancer", "f5", "nas", "storage", "cluster",
+	}
+	
+	hasKeyword := false
+	for _, keyword := range keywords {
+		if strings.Contains(text, keyword) {
+			hasKeyword = true
+			break
+		}
+	}
+	
+	hasHeaderStyle := p.hasAttribute(firstCell, "bgcolor") || 
+					  p.hasAttribute(firstCell, "rowspan") ||
+					  firstCell.Data == "th"
+	
+	return hasKeyword && (hasHeaderStyle || len(text) < 100)
+}
+
+func (p *Parser) hasAttribute(node *html.Node, attrName string) bool {
+	for _, attr := range node.Attr {
+		if attr.Key == attrName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Parser) standardizeSectionName(text string) string {
+	cleaned := strings.ToLower(regexp.MustCompile(`[^a-zA-Z0-9\s]`).ReplaceAllString(text, " "))
+	cleaned = strings.TrimSpace(cleaned)
+	
+	// Common section mappings
+	if strings.Contains(cleaned, "dns") {
+		return "dnsServers"
+	}
+	if strings.Contains(cleaned, "web") && strings.Contains(cleaned, "server") {
+		return "webServers"
+	}
+	if strings.Contains(cleaned, "app") && strings.Contains(cleaned, "server") {
+		return "applicationServers"
+	}
+	if strings.Contains(cleaned, "database") || strings.Contains(cleaned, "db") {
+		return "databases"
+	}
+	if strings.Contains(cleaned, "oracle") {
+		return "oracleServers"
+	}
+	if strings.Contains(cleaned, "vip") {
+		return "virtualIps"
+	}
+	if strings.Contains(cleaned, "load balancer") || strings.Contains(cleaned, "f5") {
+		return "loadBalancers"
+	}
+	if strings.Contains(cleaned, "router") {
+		return "routers"
+	}
+	if strings.Contains(cleaned, "switch") {
+		return "switches"
+	}
+	if strings.Contains(cleaned, "network") {
+		return "networkDevices"
+	}
+	if strings.Contains(cleaned, "storage") || strings.Contains(cleaned, "nas") {
+		return "storageDevices"
+	}
+	if strings.Contains(cleaned, "cluster") {
+		return "clusters"
+	}
+	
+	// Convert to camelCase
+	words := strings.Fields(cleaned)
+	if len(words) == 0 {
+		return "general"
+	}
+	
+	result := words[0]
+	for i := 1; i < len(words); i++ {
+		result += strings.Title(words[i])
+	}
+	
+	return result
+}
+
+func (p *Parser) isEmptyRow(row *html.Node) bool {
+	text := strings.TrimSpace(p.getTextContent(row))
+	return text == "" || text == "\u00a0" || regexp.MustCompile(`^\s*$`).MatchString(text)
+}
+
+func (p *Parser) parseTableDataRow(row *html.Node, sectionName string, environmentHeaders []string, 
+	tableData map[string]map[string][]RowEntry, generatedKeyCounters map[string]int) {
+	
+	if tableData[sectionName] == nil {
+		tableData[sectionName] = make(map[string][]RowEntry)
+	}
+	
+	cells := p.findTableCells(row)
+	envIndex := 0
+	startCellIndex := 0
+	var rowKey string
+	
+	// Check if first cell contains a meaningful key
+	if len(cells) > 0 {
+		firstCell := cells[0]
+		firstCellText := strings.TrimSpace(p.getTextContent(firstCell))
+		
+		if p.hasAttribute(firstCell, "rowspan") || 
+		   p.hasAttribute(firstCell, "bgcolor") || 
+		   p.isSectionHeaderRow(row) {
+			startCellIndex = 1
+			rowKey = p.extractRowKey(firstCellText)
+		} else if p.hasRowKey(firstCellText) {
+			startCellIndex = 1
+			rowKey = p.extractRowKey(firstCellText)
+		} else {
+			// No meaningful key found, generate one
+			rowKey = p.generateRowKey(sectionName, generatedKeyCounters)
+			startCellIndex = 0
+		}
+	}
+	
+	// Initialize row data
+	rowData := make(map[string][]map[string]interface{})
+	
+	// Process each data cell
+	for cellIndex := startCellIndex; cellIndex < len(cells); cellIndex++ {
+		cell := cells[cellIndex]
+		colspan := p.getColspan(cell)
+		cellData := p.parseGenericCellContent(cell, sectionName)
+		
+		// Distribute to environments
+		for spanIndex := 0; spanIndex < colspan; spanIndex++ {
+			if envIndex < len(environmentHeaders) {
+				envName := environmentHeaders[envIndex]
+				
+				if rowData[envName] == nil {
+					rowData[envName] = make([]map[string]interface{}, 0)
+				}
+				
+				if len(cellData) > 0 {
+					// Create deep copy for each environment
+					envData := make([]map[string]interface{}, len(cellData))
+					copy(envData, cellData)
+					rowData[envName] = append(rowData[envName], envData...)
+				}
+			}
+			envIndex++
+		}
+	}
+	
+	// Add row data to table data with the determined key
+	p.addRowDataWithKey(tableData, sectionName, rowKey, rowData)
+}
+
+func (p *Parser) hasRowKey(text string) bool {
+	if text == "" || text == "\u00a0" {
+		return false
+	}
+	
+	// Skip if it's just an IP address
+	ipRegex := regexp.MustCompile(`^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`)
+	if ipRegex.MatchString(text) {
+		return false
+	}
+	
+	// Skip if it's just a hostname
+	hostnameRegex := regexp.MustCompile(`^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$`)
+	if hostnameRegex.MatchString(text) {
+		return false
+	}
+	
+	// Skip if it's just a number
+	if regexp.MustCompile(`^\d+$`).MatchString(text) {
+		return false
+	}
+	
+	// Common row key indicators
+	indicators := []string{
+		"server", "host", "node", "instance", "service", "application",
+		"database", "cluster", "vip", "load balancer", "router", "switch",
+		"dns", "storage", "backup", "monitoring", "security", "firewall",
+		"tier", "layer", "zone", "region", "datacenter", "rack", "cabinet",
+	}
+	
+	lowerText := strings.ToLower(text)
+	for _, indicator := range indicators {
+		if strings.Contains(lowerText, indicator) {
+			return true
+		}
+	}
+	
+	// Consider it a key if it's descriptive text
+	return len(text) > 3 && regexp.MustCompile(`[a-zA-Z]`).MatchString(text) && 
+		   !regexp.MustCompile(`^[A-Z0-9\-_.]+$`).MatchString(text)
+}
+
+func (p *Parser) extractRowKey(text string) string {
+	if text == "" {
+		return ""
+	}
+	
+	// Clean and normalize
+	key := strings.TrimSpace(text)
+	key = regexp.MustCompile(`[:\[\]()]`).ReplaceAllString(key, "")
+	key = regexp.MustCompile(`\s+`).ReplaceAllString(key, " ")
+	key = strings.TrimSpace(key)
+	
+	return p.toCamelCase(key)
+}
+
+func (p *Parser) generateRowKey(sectionName string, counters map[string]int) string {
+	counters[sectionName]++
+	return fmt.Sprintf("generatedKey_%d", counters[sectionName])
+}
+
+func (p *Parser) addRowDataWithKey(tableData map[string]map[string][]RowEntry, sectionName string, 
+	rowKey string, rowData map[string][]map[string]interface{}) {
+	
+	isGeneratedKey := strings.HasPrefix(rowKey, "generatedKey_")
+	
+	for envName, envData := range rowData {
+		if tableData[sectionName][envName] == nil {
+			tableData[sectionName][envName] = make([]RowEntry, 0)
+		}
+		
+		rowEntry := RowEntry{
+			RowKey:         rowKey,
+			IsGeneratedKey: isGeneratedKey,
+			Data:           envData,
+		}
+		
+		if len(envData) > 0 {
+			tableData[sectionName][envName] = append(tableData[sectionName][envName], rowEntry)
+		}
+	}
+}
+
+func (p *Parser) toCamelCase(str string) string {
+	str = strings.ToLower(str)
+	str = regexp.MustCompile(`[^a-zA-Z0-9\s]`).ReplaceAllString(str, " ")
+	words := strings.Fields(str)
+	
+	if len(words) == 0 {
+		return ""
+	}
+	
+	result := words[0]
+	for i := 1; i < len(words); i++ {
+		result += strings.Title(words[i])
+	}
+	
+	return result
+}
+
+func (p *Parser) parseGenericCellContent(cell *html.Node, sectionName string) []map[string]interface{} {
+	var content []map[string]interface{}
+	text := strings.TrimSpace(p.getTextContent(cell))
+	
+	if text == "" {
+		return content
+	}
+	
+	// Handle nested tables
+	nestedTables := p.findTables(cell)
+	if len(nestedTables) > 0 {
+		for _, nestedTable := range nestedTables {
+			nestedData := p.parseTable(nestedTable)
+			if len(nestedData) > 0 {
+				content = append(content, map[string]interface{}{
+					"nestedTable": nestedData,
+				})
+			}
+		}
+		return content
+	}
+	
+	// Split content into logical parts
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			parsed := p.parseContentLine(line, sectionName)
+			if parsed != nil {
+				content = append(content, parsed)
+			}
+		}
+	}
+	
+	return content
+}
+
+func (p *Parser) parseContentLine(line, sectionName string) map[string]interface{} {
+	if line == "" || line == "\u00a0" {
+		return nil
+	}
+	
+	result := make(map[string]interface{})
+	
+	// Extract hostname
+	hostnameRegex := regexp.MustCompile(`([a-zA-Z0-9\-\.]+\.(?:[a-zA-Z]{2,}\.)*[a-zA-Z]{2,})`)
+	if matches := hostnameRegex.FindStringSubmatch(line); len(matches) > 1 {
+		result["hostname"] = matches[1]
+	}
+	
+	// Extract IP addresses
+	ipRegex := regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+	ipMatches := ipRegex.FindAllString(line, -1)
+	if len(ipMatches) == 1 {
+		result["ip"] = ipMatches[0]
+	} else if len(ipMatches) > 1 {
+		result["ips"] = ipMatches
+	}
+	
+	// Extract ports
+	portRegex := regexp.MustCompile(`(?i)(?:port|:)\s*(\d{3,5})`)
+	if matches := portRegex.FindStringSubmatch(line); len(matches) > 1 {
+		if port, err := strconv.Atoi(matches[1]); err == nil {
+			result["port"] = port
+		}
+	}
+	
+	// Extract VLAN
+	vlanRegex := regexp.MustCompile(`(?i)vlan[:\s]*([a-zA-Z0-9_\-]+)`)
+	if matches := vlanRegex.FindStringSubmatch(line); len(matches) > 1 {
+		result["vlan"] = matches[1]
+	}
+	
+	// Extract CPU info
+	cpuRegex := regexp.MustCompile(`(?i)cpu[:\s]*(\d+[x×]\d+|\d+)`)
+	if matches := cpuRegex.FindStringSubmatch(line); len(matches) > 1 {
+		result["cpu"] = matches[1]
+	}
+	
+	// Extract memory
+	memoryRegex := regexp.MustCompile(`(?i)memory[:\s]*(\d+[a-zA-Z]*)`)
+	if matches := memoryRegex.FindStringSubmatch(line); len(matches) > 1 {
+		result["memory"] = matches[1]
+	}
+	
+	// Extract disk/storage
+	diskRegex := regexp.MustCompile(`(?i)(?:disk|storage)[:\s]*([0-9,\sGTBgb]+)`)
+	if matches := diskRegex.FindStringSubmatch(line); len(matches) > 1 {
+		result["storage"] = matches[1]
+	}
+	
+	// If no structured data found, store as description
+	if len(result) == 0 {
+		result["description"] = line
+	}
+	
+	return result
+}
+
+func (p *Parser) detectApplicationName(table *html.Node) string {
+	// Look for application indicators in table
+	var captions []*html.Node
+	p.walkHTML(table, func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "caption" {
+			captions = append(captions, n)
+		}
+	})
+	
+	for _, caption := range captions {
+		text := strings.TrimSpace(p.getTextContent(caption))
+		if text != "" && !strings.Contains(strings.ToLower(text), "environment matrix") {
+			return p.sanitizeApplicationName(text)
+		}
+	}
+	
+	return ""
+}
+
+func (p *Parser) sanitizeApplicationName(name string) string {
+	name = regexp.MustCompile(`[^a-zA-Z0-9\s]`).ReplaceAllString(name, " ")
+	name = regexp.MustCompile(`\s+`).ReplaceAllString(name, "_")
+	name = strings.ToLower(name)
+	if len(name) > 50 {
+		name = name[:50]
+	}
+	return name
+}
+
+func (p *Parser) mergeTableData(target map[string]map[string][]RowEntry, source map[string]map[string][]RowEntry) {
+	for sectionKey, sectionValue := range source {
+		if target[sectionKey] == nil {
+			target[sectionKey] = make(map[string][]RowEntry)
+		}
+		
+		for envKey, envValue := range sectionValue {
+			if target[sectionKey][envKey] == nil {
+				target[sectionKey][envKey] = make([]RowEntry, 0)
+			}
+			target[sectionKey][envKey] = append(target[sectionKey][envKey], envValue...)
+		}
+	}
+}
+
+// Utility functions
+func (p *Parser) walkHTML(node *html.Node, fn func(*html.Node)) {
+	fn(node)
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		p.walkHTML(child, fn)
+	}
+}
+
+func (p *Parser) getTextContent(node *html.Node) string {
+	if node.Type == html.TextNode {
+		return node.Data
+	}
+	
+	var text strings.Builder
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		text.WriteString(p.getTextContent(child))
+	}
+	return text.String()
+}
+
+// Main function
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go <html_file> [output_directory] [options]")
+		fmt.Println("Example: go run main.go infrastructure.html ./json_output")
+		fmt.Println("\nOptions:")
+		fmt.Println("  --analyze         Show analysis of generated vs named keys")
+		fmt.Println("  --columns         Show detailed column structure analysis") 
+		fmt.Println("  --validate        Validate column consistency across tables")
+		fmt.Println("  --verbose         Show verbose parsing information")
+		fmt.Println("\nFeatures:")
+		fmt.Println("  ✓ Handles variable column structures across tables")
+		fmt.Println("  ✓ Detects environment columns dynamically per table")
+		fmt.Println("  ✓ Supports tables with different numbers of environments")
+		fmt.Println("  ✓ Generates keys for rows without explicit headers")
+		fmt.Println("  ✓ Creates separate JSON files per AIM ID")
+		os.Exit(1)
+	}
+	
+	htmlFile := os.Args[1]
+	outputDir := "./parsed_output"
+	if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "--") {
+		outputDir = os.Args[2]
+	}
+	
+	showAnalysis := contains(os.Args, "--analyze")
+	showColumns := contains(os.Args, "--columns")
+	validateColumns := contains(os.Args, "--validate")
+	verbose := contains(os.Args, "--verbose")
+	
+	fmt.Printf("🚀 Parsing HTML file: %s\n", htmlFile)
+	fmt.Printf("📁 Output directory: %s\n", outputDir)
+	
+	parser := NewParser()
+	results, err := parser.ParseHTMLFile(htmlFile)
+	if err != nil {
+		fmt.Printf("❌ Failed to parse file: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Create output directory
+	err = os.MkdirAll(outputDir, 0755)
+	if err != nil {
+		fmt.Printf("❌ Failed to create output directory: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Save individual JSON files
+	var savedFiles []string
+	for _, aimData := range results {
+		fileName := fmt.Sprintf("%s_%s.json", 
+			aimData.AimID, 
+			regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(aimData.SectionName, "_"))
+		outputPath := filepath.Join(outputDir, fileName)
+		
+		jsonData, err := json.MarshalIndent(aimData, "", "  ")
+		if err != nil {
+			fmt.Printf("❌ Failed to marshal JSON for AIM %s: %v\n", aimData.AimID, err)
+			continue
+		}
+		
+		err = ioutil.WriteFile(outputPath, jsonData, 0644)
+		if err != nil {
+			fmt.Printf("❌ Failed to write file %s: %v\n", outputPath, err)
+			continue
+		}
+		
+		savedFiles = append(savedFiles, outputPath)
+		
+		fmt.Printf("\nSaved AIM ID %s: %s\n", aimData.AimID, outputPath)
+		
+		applications := make([]string, 0, len(aimData.Applications))
+		for app := range aimData.Applications {
+			applications = append(applications, app)
+		}
+		fmt.Printf("  Applications: %s\n", strings.Join(applications, ", "))
+		
+		sections := make([]string, 0, len(aimData.Data))
+		for section := range aimData.Data {
+			sections = append(sections, section)
+		}
+		fmt.Printf("  Sections: %s\n", strings.Join(sections, ", "))
+		
+		if verbose {
+			displayColumnInfo(aimData)
+		}
+	}
+	
+	// Save combined results
+	combinedPath := filepath.Join(outputDir, "combined_all_aims.json")
+	combinedData, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		fmt.Printf("❌ Failed to marshal combined JSON: %v\n", err)
+	} else {
+		err = ioutil.WriteFile(combinedPath, combinedData, 0644)
+		if err != nil {
+			fmt.Printf("❌ Failed to write combined file: %v\n", err)
+		} else {
+			savedFiles = append(savedFiles, combinedPath)
+		}
+	}
+	
+	if verbose {
+		fmt.Printf("\n📊 Processing completed:\n")
+		fmt.Printf("   - Found %d AIM ID sections\n", len(results))
+		fmt.Printf("   - Generated individual JSON files for each AIM ID\n")
+		fmt.Printf("   - Created combined JSON with all data\n")
+	}
+	
+	if showColumns {
+		analyzeColumnStructure(results)
+	}
+	
+	if validateColumns {
+		validateColumnConsistency(results)
+	}
+	
+	if showAnalysis {
+		analyzeResults(results)
+	}
+	
+	fmt.Printf("\n✅ Parsing completed successfully!\n")
+	fmt.Printf("📈 Summary:\n")
+	for i, aimData := range results {
+		sectionCount := len(aimData.Data)
+		totalColumns := make(map[string]bool)
+		
+		for _, section := range aimData.Data {
+			for env := range section {
+				totalColumns[env] = true
+			}
+		}
+		
+		fmt.Printf("   %d. AIM %s: %d sections, %d unique columns\n", 
+			i+1, aimData.AimID, sectionCount, len(totalColumns))
+	}
+}
+
+// Helper functions
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func displayColumnInfo(aimData InfrastructureData) {
+	fmt.Printf("\n  Column Structure Analysis:\n")
+	
+	for sectionName, sectionData := range aimData.Data {
+		environments := make([]string, 0, len(sectionData))
+		for env := range sectionData {
+			environments = append(environments, env)
+		}
+		
+		if len(environments) > 0 {
+			fmt.Printf("    %s: %d columns [%s]\n", 
+				sectionName, len(environments), strings.Join(environments, ", "))
+			
+			for _, env := range environments {
+				rowCount := len(sectionData[env])
+				generatedKeys := 0
+				for _, entry := range sectionData[env] {
+					if entry.IsGeneratedKey {
+						generatedKeys++
+					}
+				}
+				
+				if rowCount > 0 {
+					fmt.Printf("      %s: %d rows (%d with generated keys)\n", 
+						env, rowCount, generatedKeys)
+				}
+			}
+		}
+	}
+}
+
+func analyzeColumnStructure(results []InfrastructureData) {
+	fmt.Printf("\n=== COLUMN STRUCTURE ANALYSIS ===\n")
+	
+	columnSummary := make(map[string][]string)
+	
+	for _, aimData := range results {
+		fmt.Printf("\nAIM ID: %s - %s\n", aimData.AimID, aimData.SectionName)
+		
+		for sectionName, sectionData := range aimData.Data {
+			environments := make([]string, 0, len(sectionData))
+			for env := range sectionData {
+				environments = append(environments, env)
+			}
+			
+			if len(environments) > 0 {
+				key := fmt.Sprintf("%s_%s", aimData.AimID, sectionName)
+				columnSummary[key] = environments
+				
+				fmt.Printf("  %s:\n", sectionName)
+				fmt.Printf("    Columns (%d): %s\n", len(environments), strings.Join(environments, " | "))
+				
+				// Show sample data from first environment
+				if len(environments) > 0 {
+					firstEnv := environments[0]
+					sampleData := sectionData[firstEnv]
+					if len(sampleData) > 0 && len(sampleData[0].Data) > 0 {
+						fields := make([]string, 0)
+						for field := range sampleData[0].Data[0] {
+							fields = append(fields, field)
+						}
+						displayFields := fields
+						if len(fields) > 5 {
+							displayFields = fields[:5]
+						}
+						more := ""
+						if len(fields) > 5 {
+							more = "..."
+						}
+						fmt.Printf("    Sample fields: %s%s\n", strings.Join(displayFields, ", "), more)
+					}
+				}
+			}
+		}
+	}
+	
+	// Show unique column patterns
+	fmt.Printf("\n=== UNIQUE COLUMN PATTERNS ===\n")
+	patterns := make(map[string]bool)
+	for _, cols := range columnSummary {
+		pattern := strings.Join(cols, " | ")
+		patterns[pattern] = true
+	}
+	
+	i := 1
+	for pattern := range patterns {
+		fmt.Printf("Pattern %d: %s\n", i, pattern)
+		i++
+	}
+}
+
+func validateColumnConsistency(results []InfrastructureData) {
+	fmt.Printf("\n=== COLUMN CONSISTENCY VALIDATION ===\n")
+	
+	isConsistent := true
+	
+	for _, aimData := range results {
+		for sectionName, sectionData := range aimData.Data {
+			environments := make([]string, 0, len(sectionData))
+			for env := range sectionData {
+				environments = append(environments, env)
+			}
+			
+			if len(environments) == 0 {
+				fmt.Printf("⚠️  %s - %s: No environment columns found\n", aimData.AimID, sectionName)
+				isConsistent = false
+			} else {
+				fmt.Printf("✓ %s - %s: %d columns detected\n", aimData.AimID, sectionName, len(environments))
+			}
+		}
+	}
+	
+	if isConsistent {
+		fmt.Printf("\n✅ All sections have valid column structures\n")
+	} else {
+		fmt.Printf("\n❌ Some sections have column structure issues\n")
+	}
+}
+
+func analyzeResults(results []InfrastructureData) {
+	fmt.Printf("\n=== PARSING ANALYSIS ===\n")
+	
+	for i, aimData := range results {
+		fmt.Printf("\nAIM ID: %s\n", aimData.AimID)
+		fmt.Printf("Section: %s\n", aimData.SectionName)
+		
+		for sectionName, sectionData := range aimData.Data {
+			fmt.Printf("\n  Section: %s\n", sectionName)
+			
+			for envName, envData := range sectionData {
+				generatedKeyCount := 0
+				namedKeyCount := 0
+				
+				for _, entry := range envData {
+					if entry.IsGeneratedKey {
+						generatedKeyCount++
+					} else {
+						namedKeyCount++
+					}
+				}
+				
+				if generatedKeyCount > 0 || namedKeyCount > 0 {
+					fmt.Printf("    %s: %d named rows, %d generated key rows\n", 
+						envName, namedKeyCount, generatedKeyCount)
+				}
+			}
+		}
+	}
+}
